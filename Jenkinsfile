@@ -1,137 +1,109 @@
 pipeline {
     agent any
 
+    tools {
+        nodejs 'node18'
+    }
+
     environment {
-        AWS_REGION = 'us-east-1'
-        ECR_REGISTRY = 'YOUR_AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com'
-        ECR_REPOSITORY = 'todo-app'
-        IMAGE_TAG = "${BUILD_NUMBER}"
-        DOCKER_IMAGE = "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+        IMAGE_NAME     = 'sagarbarve/todo-app'
+        IMAGE_TAG      = 'latest'
+        CONTAINER_NAME = 'todo-app'
+        SCANNER_HOME   = tool 'sonar-scanner'
     }
 
     stages {
-        stage('Checkout') {
+
+        stage('Clean Workspace') {
             steps {
-                echo 'Checking out source code...'
-                checkout scm
+                cleanWs()
             }
         }
 
-        stage('Build') {
+        stage('Checkout Code') {
             steps {
-                echo 'Building React application...'
+                git branch: 'main',
+                    url: 'https://github.com/cs7165/React-to-do-apk.git'
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh 'npm install'
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh """
+                    ${SCANNER_HOME}/bin/sonar-scanner \
+                    -Dsonar.projectKey=react-to-do \
+                    -Dsonar.projectName=React-ToDo-App \
+                    -Dsonar.sources=src
+                    """
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 2, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
                 sh '''
-                    npm install
-                    npm run build
+                docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
                 '''
             }
         }
 
-        stage('Test') {
+        stage('Run Container') {
             steps {
-                echo 'Running tests...'
                 sh '''
-                    npm test -- --coverage --watchAll=false || true
+                docker rm -f ${CONTAINER_NAME} || true
+                docker run -d \
+                  --name ${CONTAINER_NAME} \
+                  -p 3000:3000 \
+                  --restart always \
+                  ${IMAGE_NAME}:${IMAGE_TAG}
                 '''
             }
         }
 
-        stage('Docker Build') {
+        stage('Push Image to Docker Hub') {
             steps {
-                echo 'Building Docker image...'
-                sh '''
-                    docker build -t ${DOCKER_IMAGE} .
-                    docker tag ${DOCKER_IMAGE} ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
-                '''
-            }
-        }
-
-        stage('ECR Login') {
-            steps {
-                echo 'Logging into AWS ECR...'
-                sh '''
-                    aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-                '''
-            }
-        }
-
-        stage('Push to ECR') {
-            steps {
-                echo 'Pushing image to ECR...'
-                sh '''
-                    docker push ${DOCKER_IMAGE}
-                    docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
-                '''
-            }
-        }
-
-        stage('Deploy to EC2') {
-            steps {
-                echo 'Deploying to AWS EC2...'
-                sh '''
-                    # Get the EC2 instance details from Terraform output
-                    EC2_INSTANCE=$(terraform output -raw ec2_instance_ip 2>/dev/null || echo "")
-                    
-                    if [ -z "$EC2_INSTANCE" ]; then
-                        echo "No EC2 instance found. Skipping deployment."
-                        exit 0
-                    fi
-                    
-                    # SSH into EC2 and deploy
-                    ssh -o StrictHostKeyChecking=no -i ${JENKINS_EC2_KEY} ec2-user@${EC2_INSTANCE} << 'EOF'
-                        # Login to ECR
-                        aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-                        
-                        # Stop and remove old container
-                        docker stop todo-app || true
-                        docker rm todo-app || true
-                        
-                        # Pull latest image
-                        docker pull ${DOCKER_IMAGE}
-                        
-                        # Run new container on port 3000
-                        docker run -d \
-                            --name todo-app \
-                            -p 3000:3000 \
-                            --restart always \
-                            ${DOCKER_IMAGE}
-                        
-                        echo "Deployment successful!"
-EOF
-                '''
-            }
-        }
-
-        stage('Health Check') {
-            steps {
-                echo 'Performing health check...'
-                sh '''
-                    EC2_INSTANCE=$(terraform output -raw ec2_instance_ip 2>/dev/null || echo "")
-                    
-                    if [ -n "$EC2_INSTANCE" ]; then
-                        # Wait for container to start
-                        sleep 10
-                        
-                        # Check if application is running
-                        curl -f http://${EC2_INSTANCE}/ || exit 1
-                    fi
-                '''
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-cred',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )
+                ]) {
+                    sh '''
+                    echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                    docker push ${IMAGE_NAME}:${IMAGE_TAG}
+                    '''
+                }
             }
         }
     }
 
     post {
-        always {
-            echo 'Pipeline execution completed.'
-            cleanWs()
-        }
-
         success {
-            echo 'Pipeline succeeded! Application deployed to EC2.'
+            echo '✅ Build + SonarQube + Quality Gate + Docker Push successful'
         }
 
         failure {
-            echo 'Pipeline failed. Check logs for details.'
+            echo '❌ Pipeline failed'
+        }
+
+        always {
+            sh 'docker logout || true'
         }
     }
 }
